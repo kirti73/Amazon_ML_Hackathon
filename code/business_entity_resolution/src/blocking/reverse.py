@@ -1,18 +1,16 @@
 """
-Route 4 — Character N-Gram TF-IDF Retrieval (Business Address)
-==============================================================
+Route 7 — Reverse Retrieval ((S2 + S3) -> S1)
+==============================================
 
 Strategy
 --------
-1. Normalize address strings using the conservative P1 stub.
-2. Build character 3,4-gram TF-IDF representations for candidate addresses
-   in the combined S2 + S3 candidate pool.
-3. Query S1 in memory-safe chunks (e.g., 5,000 rows at a time).
-4. For each S1 query, retrieve top-k candidates (default k=20) by cosine
-   similarity without ever materializing the full S1 x (S2+S3) matrix.
-5. Handle blank/missing addresses safely: records with empty addresses
-   produce empty vectors and do not raise errors.
-6. Deterministic tie-breaking: sort by score desc, then candidate_id asc.
+1. Vectorize the S1 index (business name char 3,4-grams).
+2. Query candidate records from S2 and S3 against the S1 index in memory-safe chunks.
+3. For each S2/S3 query, retrieve top-k_reverse (default k=5) matching S1 records.
+4. Convert every reverse match (candidate -> S1) into standard candidate schema
+   (s1_id, candidate_id, candidate_source, pair_key).
+5. Deterministic tie-breaking and rank calculation per S1 record:
+   sort by score desc, then candidate_id asc.
 
 Candidate Schema
 ----------------
@@ -22,7 +20,7 @@ pair_key, s1_id, candidate_id, candidate_source, route, rank, score
 import math
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -30,35 +28,27 @@ import pandas as pd
 import scipy.sparse as sp
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants & Defaults
 # ---------------------------------------------------------------------------
-ROUTE_NAME: str = "tfidf_address"
-DEFAULT_TOP_K: int = 20
+ROUTE_NAME: str = "reverse_retrieval"
+DEFAULT_TOP_K_REVERSE: int = 5
 DEFAULT_CHUNK_SIZE: int = 5000
 DEFAULT_NGRAM_RANGE: Tuple[int, int] = (3, 4)
 DEFAULT_MIN_DF: int = 2
-MIN_SCORE_THRESHOLD: float = 0.05  # Ignore negligible cosine similarities
+MIN_SCORE_THRESHOLD: float = 0.10
 
 
 # ---------------------------------------------------------------------------
-# P1 normalization stub (Isolated from P2's feature normalizer)
+# Normalization Stub
 # ---------------------------------------------------------------------------
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+", re.UNICODE)
 
 
-def normalize_address(text: str) -> str:
-    """Conservative P1 normalization for address strings.
-
-    Steps:
-        1. Unicode NFKC decomposition
-        2. casefold (locale-agnostic lower-case)
-        3. Replace punctuation characters with space
-        4. Collapse whitespace and strip
-    """
+def normalize_name(text: str) -> str:
+    """Conservative P1 normalization for name strings."""
     if not text or not isinstance(text, str):
         return ""
-    # Treat NaN string or empty as blank
     if text.strip().lower() in ("nan", "none", "null"):
         return ""
     s = unicodedata.normalize("NFKC", text)
@@ -69,14 +59,10 @@ def normalize_address(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Standalone Sparse Character N-Gram TF-IDF Vectorizer
+# Standalone Sparse Vectorizer
 # ---------------------------------------------------------------------------
 class CharTfidfVectorizer:
-    """Fast, memory-safe sparse character n-gram TF-IDF vectorizer.
-
-    Produces L2-normalized CSR sparse matrices using sublinear TF-IDF weighting:
-    tf = 1 + log(tf), idf = log((1 + N) / (1 + df)) + 1.
-    """
+    """Fast, memory-safe sparse character n-gram TF-IDF vectorizer."""
 
     def __init__(
         self,
@@ -109,7 +95,6 @@ class CharTfidfVectorizer:
             unique_ngrams = set(self._extract_ngrams(doc))
             df_counts.update(unique_ngrams)
 
-        # Alphabetical sorting for deterministic vocabulary indexing
         valid_terms = sorted(
             [term for term, count in df_counts.items() if count >= self.min_df]
         )
@@ -153,7 +138,6 @@ class CharTfidfVectorizer:
             (data, (rows, cols)), shape=(n_docs, n_terms), dtype=np.float32
         )
 
-        # L2 normalize each row in-place
         for i in range(n_docs):
             r_start = mat.indptr[i]
             r_end = mat.indptr[i + 1]
@@ -167,57 +151,34 @@ class CharTfidfVectorizer:
 
 
 # ---------------------------------------------------------------------------
-# Retrieval Pipeline
+# Route 7 Retrieval Pipeline
 # ---------------------------------------------------------------------------
-def _build_candidate_pool(
-    s2_df: pd.DataFrame,
-    s3_df: pd.DataFrame,
-    id_col: str = "entity_id",
-    addr_col: str = "business_address",
-) -> Tuple[List[str], List[str], List[str]]:
-    """Extract and normalize candidate addresses from S2 and S3."""
-    cand_ids: List[str] = []
-    cand_sources: List[str] = []
-    cand_addrs: List[str] = []
-
-    for df, source_label in [(s2_df, "S2"), (s3_df, "S3")]:
-        for _, row in df.iterrows():
-            eid = str(row[id_col])
-            raw_addr = str(row.get(addr_col, "") or "")
-            norm_addr = normalize_address(raw_addr)
-            cand_ids.append(eid)
-            cand_sources.append(source_label)
-            cand_addrs.append(norm_addr)
-
-    return cand_ids, cand_sources, cand_addrs
-
-
-def retrieve_tfidf_address(
+def retrieve_reverse(
     s1_df: pd.DataFrame,
     s2_df: pd.DataFrame,
     s3_df: pd.DataFrame,
     id_col: str = "entity_id",
-    addr_col: str = "business_address",
-    top_k: int = DEFAULT_TOP_K,
+    name_col: str = "business_name",
+    top_k_reverse: int = DEFAULT_TOP_K_REVERSE,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     ngram_range: Tuple[int, int] = DEFAULT_NGRAM_RANGE,
     min_df: int = DEFAULT_MIN_DF,
     min_score: float = MIN_SCORE_THRESHOLD,
     vectorizer: Optional[CharTfidfVectorizer] = None,
 ) -> pd.DataFrame:
-    """Retrieve top-k candidates for each S1 record using char n-gram TF-IDF on address.
+    """Retrieve candidate pairs in the reverse direction: (S2 + S3) queries -> S1 index.
 
     Parameters
     ----------
-    s1_df, s2_df, s3_df : DataFrames with [id_col, addr_col].
-    id_col              : ID column name.
-    addr_col            : Business address column name.
-    top_k               : Number of candidates to retrieve per S1 record.
-    chunk_size          : Batch size of S1 queries to process at once.
-    ngram_range         : Character n-gram range (default 3, 4).
-    min_df              : Minimum document frequency for n-grams.
-    min_score           : Minimum cosine similarity score threshold.
-    vectorizer          : Optional pre-fitted CharTfidfVectorizer.
+    s1_df, s2_df, s3_df : DataFrames with [id_col, name_col].
+    id_col              : Entity ID column name.
+    name_col            : Business name column name.
+    top_k_reverse       : Max S1 records to retrieve per S2/S3 entity.
+    chunk_size          : Chunk size for S2/S3 querying.
+    ngram_range         : Character n-gram range.
+    min_df              : Min document frequency.
+    min_score           : Min cosine similarity score.
+    vectorizer          : Optional pre-fitted vectorizer.
 
     Returns
     -------
@@ -225,109 +186,132 @@ def retrieve_tfidf_address(
         pair_key, s1_id, candidate_id, candidate_source,
         route, rank, score
     """
-    # 1. Prepare candidate pool
-    cand_ids, cand_sources, cand_addrs = _build_candidate_pool(
-        s2_df, s3_df, id_col=id_col, addr_col=addr_col
-    )
-    n_candidates = len(cand_ids)
-    if n_candidates == 0 or len(s1_df) == 0:
+    if len(s1_df) == 0 or (len(s2_df) == 0 and len(s3_df) == 0):
         return _empty_candidate_df()
 
-    # 2. Prepare S1 query data
+    # 1. Prepare S1 index data
     s1_ids: List[str] = []
-    s1_addrs: List[str] = []
+    s1_names: List[str] = []
     for _, row in s1_df.iterrows():
         s1_ids.append(str(row[id_col]))
-        raw_addr = str(row.get(addr_col, "") or "")
-        s1_addrs.append(normalize_address(raw_addr))
+        raw = str(row.get(name_col, "") or "")
+        s1_names.append(normalize_name(raw))
+
+    # 2. Prepare S2 and S3 query pool
+    cand_ids: List[str] = []
+    cand_sources: List[str] = []
+    cand_names: List[str] = []
+    for df, src_label in [(s2_df, "S2"), (s3_df, "S3")]:
+        for _, row in df.iterrows():
+            eid = str(row[id_col])
+            raw = str(row.get(name_col, "") or "")
+            cand_ids.append(eid)
+            cand_sources.append(src_label)
+            cand_names.append(normalize_name(raw))
 
     # 3. Fit or use vectorizer
     if vectorizer is None:
         effective_min_df = (
-            min_df if (len(cand_addrs) + len(s1_addrs)) >= 100 else 1
+            min_df if (len(cand_names) + len(s1_names)) >= 100 else 1
         )
         vectorizer = CharTfidfVectorizer(
             ngram_range=ngram_range,
             min_df=effective_min_df,
             sublinear_tf=True,
         )
-        # Fit on non-empty address corpus
-        all_corpus = [a for a in (cand_addrs + s1_addrs) if a]
+        all_corpus = [n for n in (s1_names + cand_names) if n]
         if all_corpus:
             vectorizer.fit(all_corpus)
         else:
             return _empty_candidate_df()
 
-    # 4. Transform candidate pool (l2-normalized)
-    cand_matrix = vectorizer.transform(cand_addrs)  # (N_cand, V) CSR
-    cand_matrix_t = cand_matrix.T.tocsc()          # (V, N_cand) CSC for fast dot
+    # 4. Transform S1 index (N_s1, V) and transpose for CSC dot
+    s1_matrix = vectorizer.transform(s1_names)
+    s1_matrix_t = s1_matrix.T.tocsc()
 
-    # 5. Process S1 queries in memory-safe chunks
-    records = []
-    n_queries = len(s1_ids)
+    # 5. Query candidate pool in chunks against S1 index
+    # Map from s1_id -> dict of {cand_id: (candidate_source, max_score)}
+    s1_to_candidates: Dict[str, Dict[str, Tuple[str, float]]] = defaultdict(dict)
 
+    n_queries = len(cand_ids)
     for start_idx in range(0, n_queries, chunk_size):
         end_idx = min(start_idx + chunk_size, n_queries)
-        chunk_s1_ids = s1_ids[start_idx:end_idx]
-        chunk_s1_addrs = s1_addrs[start_idx:end_idx]
+        chunk_cids = cand_ids[start_idx:end_idx]
+        chunk_csrcs = cand_sources[start_idx:end_idx]
+        chunk_cnames = cand_names[start_idx:end_idx]
 
-        # Vectorize chunk queries: (chunk_len, V) CSR
-        chunk_q = vectorizer.transform(chunk_s1_addrs)
+        # Vectorize chunk queries: (chunk_len, V)
+        chunk_q = vectorizer.transform(chunk_cnames)
 
-        # Chunk similarity matrix: (chunk_len, N_cand)
-        sim_matrix = chunk_q.dot(cand_matrix_t).tocsr()
+        # Dot product against S1: (chunk_len, N_s1)
+        sim_matrix = chunk_q.dot(s1_matrix_t).tocsr()
 
-        # Extract top-k for each query row
         for i in range(sim_matrix.shape[0]):
-            curr_s1_id = chunk_s1_ids[i]
+            cand_id = chunk_cids[i]
+            cand_src = chunk_csrcs[i]
+
             row_start = sim_matrix.indptr[i]
             row_end = sim_matrix.indptr[i + 1]
-
             if row_start == row_end:
                 continue
 
             row_indices = sim_matrix.indices[row_start:row_end]
             row_data = sim_matrix.data[row_start:row_end]
 
-            # Filter by min_score
             mask = row_data >= min_score
             if not np.any(mask):
                 continue
 
-            valid_indices = row_indices[mask]
+            valid_s1_indices = row_indices[mask]
             valid_scores = row_data[mask]
 
-            # Select top-k
-            if len(valid_scores) > top_k:
-                top_part_idx = np.argpartition(-valid_scores, top_k)[:top_k]
-                selected_cand_indices = valid_indices[top_part_idx]
+            if len(valid_scores) > top_k_reverse:
+                top_part_idx = np.argpartition(-valid_scores, top_k_reverse)[
+                    :top_k_reverse
+                ]
+                selected_s1_indices = valid_s1_indices[top_part_idx]
                 selected_scores = valid_scores[top_part_idx]
             else:
-                selected_cand_indices = valid_indices
+                selected_s1_indices = valid_s1_indices
                 selected_scores = valid_scores
 
-            # Deterministic tie-breaking: primary by score desc, secondary by candidate_id asc
-            items = []
-            for cand_idx, score_val in zip(selected_cand_indices, selected_scores):
-                c_id = cand_ids[cand_idx]
-                c_src = cand_sources[cand_idx]
-                items.append((float(score_val), c_id, c_src))
+            for s1_idx, score_val in zip(selected_s1_indices, selected_scores):
+                s1_id = s1_ids[s1_idx]
+                score_f = float(score_val)
+                # Keep highest score if duplicate encountered
+                if (
+                    cand_id not in s1_to_candidates[s1_id]
+                    or score_f > s1_to_candidates[s1_id][cand_id][1]
+                ):
+                    s1_to_candidates[s1_id][cand_id] = (cand_src, score_f)
 
-            items.sort(key=lambda x: (-x[0], x[1]))
-            items = items[:top_k]
+    # 6. Format final candidate records sorted deterministically per S1
+    records = []
+    # Sort S1 keys for deterministic output ordering
+    sorted_s1_ids = sorted(s1_to_candidates.keys())
 
-            for rank, (score_val, c_id, c_src) in enumerate(items, start=1):
-                records.append(
-                    {
-                        "pair_key": f"{curr_s1_id}::{c_id}",
-                        "s1_id": curr_s1_id,
-                        "candidate_id": c_id,
-                        "candidate_source": c_src,
-                        "route": ROUTE_NAME,
-                        "rank": rank,
-                        "score": round(score_val, 6),
-                    }
-                )
+    for s1_id in sorted_s1_ids:
+        cand_dict = s1_to_candidates[s1_id]
+        # Sort candidates: score desc, then candidate_id asc
+        sorted_cand_items = sorted(
+            cand_dict.items(),
+            key=lambda item: (-item[1][1], item[0]),
+        )
+
+        for rank, (cand_id, (cand_src, score_val)) in enumerate(
+            sorted_cand_items, start=1
+        ):
+            records.append(
+                {
+                    "pair_key": f"{s1_id}::{cand_id}",
+                    "s1_id": s1_id,
+                    "candidate_id": cand_id,
+                    "candidate_source": cand_src,
+                    "route": ROUTE_NAME,
+                    "rank": rank,
+                    "score": round(score_val, 6),
+                }
+            )
 
     if not records:
         return _empty_candidate_df()
