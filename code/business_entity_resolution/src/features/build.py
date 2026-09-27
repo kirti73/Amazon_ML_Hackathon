@@ -6,8 +6,11 @@ Constructs canonical features.parquet from candidate pairs and normalized record
 from __future__ import annotations
 
 import gc
+import os
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Set
+
 import numpy as np
 import pandas as pd
 
@@ -61,6 +64,22 @@ FEATURE_COLUMNS = [
 ]
 
 
+def _rss_mb() -> float:
+    """Resident set size in MB, for progress logging only."""
+    try:
+        with open("/proc/self/statm", "r") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e6
+    except Exception:
+        return float("nan")
+
+
+def _progress(message: str) -> None:
+    """Emit a progress line. Honours PY2_PROGRESS=0 to silence it."""
+    if os.environ.get("PY2_PROGRESS", "1") == "0":
+        return
+    print(f"[build_features {time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def build_features(
     candidates_df: pd.DataFrame,
     records_df: pd.DataFrame,
@@ -101,16 +120,27 @@ def build_features(
     # Pre-pivot retrieval features if available
     retrieval_feats_df = None
     if retrieval_events_df is not None and len(retrieval_events_df) > 0:
+        # This pivot is one blocking call over every event in the shard and is the single
+        # most expensive step, so it reports before and after. Without this there is no way
+        # to tell a slow pivot apart from a hung worker.
+        _t = time.time()
+        _progress(f"pivot start: {len(retrieval_events_df):,} events x {len(cand_df):,} pairs")
         retrieval_feats_df = pivot_retrieval_features(
             retrieval_events_df=retrieval_events_df,
             pair_keys=cand_df["pair_key"],
         ).set_index("pair_key")
+        _progress(f"pivot done in {time.time()-_t:.1f}s -> {len(retrieval_feats_df):,} pairs")
 
     chunks: List[pd.DataFrame] = []
     n_total = len(cand_df)
 
     for start_idx in range(0, n_total, chunk_size):
         end_idx = min(start_idx + chunk_size, n_total)
+        # Log every ~5% so a long run shows a heartbeat and a real ETA. Silence here was
+        # indistinguishable from a deadlock.
+        if (start_idx // chunk_size) % max(1, (n_total // chunk_size) // 20) == 0:
+            _progress(f"chunk {start_idx // chunk_size + 1}/{-(-n_total // chunk_size)} "
+                      f"rows {end_idx:,}/{n_total:,} rss={_rss_mb():.0f}MB")
         chunk_cands = cand_df.iloc[start_idx:end_idx].copy()
 
         # Join S1 records

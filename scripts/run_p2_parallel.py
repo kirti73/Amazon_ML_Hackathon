@@ -32,13 +32,13 @@ from __future__ import annotations
 import argparse
 import gc
 import json
-import multiprocessing as mp
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from subprocess import Popen, STDOUT
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 REPO = Path(__file__).resolve().parents[1]
+# Set per-process by main(); lets the worker helpers find the slice without a global.
+SLICE_DIR: List[str] = [""]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "code" / "business_entity_resolution"))
 
 from src.features.build import FEATURE_COLUMNS, build_features  # noqa: E402
@@ -62,6 +65,34 @@ _RECORDS: Optional[pd.DataFrame] = None
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def peak_rss_mb() -> float:
+    """True high-water RSS for this process, in MB.
+
+    ``rss_mb()`` samples only the current value, so a worker that peaked at 4 GB and then
+    freed memory reported ~2.7 GB. ru_maxrss is the kernel's own high-water mark, which is
+    the number that decides how many workers fit.
+    """
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def mem_available_mb() -> float:
+    """MemAvailable from /proc/meminfo, in MB.
+
+    Summing every process's RSS badly overstates usage, because shared pages (page cache,
+    libc, the interpreter) are counted once per process. MemAvailable is the honest
+    number for deciding whether N concurrent workers fit in RAM.
+    """
+    try:
+        with open("/proc/meminfo", "r") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return float("nan")
 
 
 def rss_mb() -> float:
@@ -223,24 +254,163 @@ def partition_events(events_path: Path, work: Path, s1_boundaries: List[str],
 # --------------------------------------------------------------------------- #
 # worker
 # --------------------------------------------------------------------------- #
-def _worker(task: Tuple[int, Path, Path, Path, int, str]) -> dict:
-    shard_id, cand_path, ev_path, out_path, chunk_size, log_prefix = task
+def _load_records(records_path: Optional[Path]) -> pd.DataFrame:
+    """Records frame from a parquet file if given, else rebuild it from the slice."""
+    if records_path is not None and Path(records_path).exists():
+        return pq.read_table(records_path).to_pandas()
+    return build_records(Path(SLICE_DIR[0]))
+
+
+def _worker(task: Tuple[int, Path, Path, Path, int, str, Optional[Path], Path]) -> dict:
+    """Build features for one shard.
+
+    Observability is the point of this rewrite. A worker now:
+      * appends its own stdout/stderr to ``worker_<id>.log``;
+      * records a ``done_<id>.json`` marker that says explicitly whether it succeeded,
+        with row count / schema / peak RSS / elapsed time, so a partial write can never be
+        mistaken for a finished shard on a later resume;
+      * writes the parquet to a temp name and ``os.replace``s it into position, so the
+        output file either does not exist or is complete;
+      * re-opens and re-reads the file it just wrote before declaring success.
+    Any exception is logged in full and re-raised, so the parent sees a real traceback
+    instead of a silent disappearance.
+    """
+    shard_id, cand_path, ev_path, out_path, chunk_size, _prefix, records_path, log_dir = task
+    log_dir = Path(log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logf = log_dir / f"worker_{shard_id}.log"
+    marker = log_dir / f"done_{shard_id}.json"
     t0 = time.time()
-    cands = pq.read_table(cand_path).to_pandas()
-    ev_path_obj = Path(ev_path)
-    events = pq.read_table(ev_path_obj).to_pandas() if ev_path_obj.exists() else None
-    feats = build_features(cands, _RECORDS, events, chunk_size=chunk_size)
-    assert len(feats) == len(cands), f"row loss: {len(feats)} != {len(cands)}"
-    pq.write_table(
-        pa.Table.from_pandas(feats, preserve_index=False), out_path, compression="zstd"
-    )
-    return {
-        "shard": shard_id,
-        "rows": len(feats),
-        "events": 0 if events is None else len(events),
-        "seconds": round(time.time() - t0, 2),
-        "peak_rss_mb": round(rss_mb(), 1),
+    result = {
+        "shard": shard_id, "rows": 0, "events": 0, "seconds": 0.0,
+        "peak_rss_mb": 0.0, "ok": False, "log": str(logf),
     }
+    try:
+        records = _load_records(records_path)
+        result["records_rows"] = int(len(records))
+        cands = pq.read_table(cand_path).to_pandas()
+        n_cand = len(cands)
+        ev_path_obj = Path(ev_path)
+        events = pq.read_table(ev_path_obj).to_pandas() if ev_path_obj.exists() else None
+        result["events"] = 0 if events is None else int(len(events))
+        result["candidates"] = int(n_cand)
+        log_line(f"[worker {shard_id}] start cand={n_cand:,} events={result['events']:,} "
+                 f"records={len(records):,} rss={rss_mb():.0f}MB")
+        feats = build_features(cands, records, events, chunk_size=chunk_size)
+        if len(feats) != n_cand:
+            raise RuntimeError(f"row loss: {len(feats)} != {n_cand}")
+        cols = list(feats.columns)
+        if cols[:3] != ["pair_key", "s1_id", "candidate_id"] or cols[3:] != FEATURE_COLUMNS:
+            raise RuntimeError(f"shard {shard_id} produced a bad schema: {cols[:5]}...")
+        # Atomic: a killed worker must not leave a half-written file that a later resume
+        # would happily accept.
+        tmp = Path(str(out_path) + ".tmp")
+        pq.write_table(
+            pa.Table.from_pandas(feats, preserve_index=False), tmp, compression="zstd"
+        )
+        del feats, cands, events, records
+        os.replace(tmp, out_path)
+        # Verify what actually landed on disk rather than trusting the write.
+        pf = pq.ParquetFile(out_path)
+        disk_rows = pf.metadata.num_rows
+        disk_cols = list(pf.schema_arrow.names)
+        if disk_rows != n_cand or disk_cols != ["pair_key", "s1_id", "candidate_id"] + FEATURE_COLUMNS:
+            raise RuntimeError(
+                f"shard {shard_id} on-disk verification failed: rows={disk_rows} "
+                f"cols={len(disk_cols)}"
+            )
+        result.update(
+            rows=disk_rows,
+            seconds=round(time.time() - t0, 2),
+            peak_rss_mb=round(peak_rss_mb(), 1),
+            ok=True,
+            output_bytes=Path(out_path).stat().st_size,
+        )
+        log_line(f"[worker {shard_id}] OK rows={disk_rows:,} "
+                 f"{result['seconds']}s peak_rss={result['peak_rss_mb']}MB")
+    except BaseException as exc:  # noqa: BLE001 - we re-raise after recording
+        import traceback
+        tb = traceback.format_exc()
+        result.update(
+            ok=False, error=f"{type(exc).__name__}: {exc}",
+            seconds=round(time.time() - t0, 2), peak_rss_mb=round(peak_rss_mb(), 1),
+        )
+        log_line(f"[worker {shard_id}] FAILED {type(exc).__name__}: {exc}\n{tb}")
+        marker.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        raise
+    marker.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def log_line(message: str) -> None:
+    """Log to stdout *and* to this worker's own file, so output survives parent loss."""
+    stamp = time.strftime("%H:%M:%S")
+    print(f"[{stamp}] {message}", flush=True)
+    try:
+        cur = _WORKER_LOG.get()
+        if cur is not None:
+            with open(cur, "a", encoding="utf-8") as fh:
+                fh.write(f"[{stamp}] {message}\n")
+    except Exception:
+        pass
+
+
+_WORKER_LOG: Optional[str] = None
+
+POLL_SECONDS = 2.0
+
+
+def shard_is_complete(shard_id: int, work: Path) -> Optional[dict]:
+    """Return the marker for a shard only if its output is really present and sound.
+
+    A marker alone is not enough: the marker and the parquet are written in that order, so
+    a crash in between would otherwise leave a marker describing a file that is not there.
+    """
+    marker = work / f"done_{shard_id}.json"
+    out = work / f"feat_{shard_id}.parquet"
+    if not marker.exists() or not out.exists():
+        return None
+    try:
+        info = json.loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not info.get("ok"):
+        return None
+    try:
+        pf = pq.ParquetFile(out)
+        if pf.metadata.num_rows != info.get("rows"):
+            return None
+        cols = list(pf.schema_arrow.names)
+        if cols != ["pair_key", "s1_id", "candidate_id"] + FEATURE_COLUMNS:
+            return None
+    except Exception:
+        return None
+    return info
+
+
+def launch_worker_subprocess(shard_id: int, work: Path, chunk_size: int,
+                             records_path: Optional[Path]) -> Tuple[Popen, Path]:
+    """Run one shard in its own process so its exit code and stderr are observable.
+
+    Using real subprocesses rather than a multiprocessing.Pool is deliberate. A Pool
+    reports a worker exception by re-raising in the parent, but it cannot tell the
+    difference between "worker raised" and "worker was killed", and a parent that dies
+    takes the whole Pool with it. A subprocess gives a genuine exit status (negative ==
+    killed by a signal) and a per-worker log file that survives the parent.
+    """
+    logf = work / f"worker_{shard_id}.log"
+    cmd = [
+        sys.executable, "-u", str(Path(__file__).resolve()),
+        "--run-worker", str(shard_id),
+        "--work-dir", str(work),
+        "--chunk-size", str(chunk_size),
+    ]
+    if records_path is not None:
+        cmd += ["--records", str(records_path)]
+    if SLICE_DIR[0]:
+        cmd += ["--slice-dir", str(SLICE_DIR[0])]
+    handle = open(logf, "a", encoding="utf-8")
+    return Popen(cmd, stdout=handle, stderr=STDOUT, cwd=str(REPO_ROOT)), logf
 
 
 # --------------------------------------------------------------------------- #
@@ -270,15 +440,26 @@ def concat_shards(shard_paths: List[Path], out_path: Path) -> Tuple[int, List[st
     return rows, first_cols
 
 
+def parquet_rows(path: Path) -> int:
+    """Row count of a parquet file, or 0 if it does not exist."""
+    path = Path(path)
+    return pq.ParquetFile(path).metadata.num_rows if path.exists() else 0
+
+
 def validate(out_path: Path, cand_path: Path, s1_path: Path,
-             known_entity_ids: Optional[set] = None) -> dict:
+             known_entity_ids: Optional[set] = None,
+             expected_rows: Optional[int] = None) -> dict:
     """P2 contract checks. There is no pre-existing P2 validator, so this defines one."""
     checks: dict = {}
     feats = pq.read_table(out_path)
     n_cand = pq.ParquetFile(cand_path).metadata.num_rows
 
     checks["features_nonempty"] = feats.num_rows > 0
-    checks["row_count_matches_candidates"] = feats.num_rows == n_cand
+    # expected_rows lets a subset run validate against the shards it actually built.
+    # Comparing a 1-shard diagnostic against the full candidate file always fails, which
+    # is noise, not signal. The full-coverage requirement is a separate check.
+    checks["row_count_matches_candidates"] = (
+        feats.num_rows == (n_cand if expected_rows is None else expected_rows))
     cols = list(feats.schema.names)
     checks["schema_39_cols"] = (
         len(cols) == 39 and cols[:3] == ["pair_key", "s1_id", "candidate_id"]
@@ -315,6 +496,160 @@ def validate(out_path: Path, cand_path: Path, s1_path: Path,
 
 
 # --------------------------------------------------------------------------- #
+
+def run_features_stage(args, work: Path, cand_path: Path, out_path: Path,
+                       records_file: Path, wanted: Optional[List[int]] = None,
+                       n_shards: Optional[int] = None, concat: bool = True) -> int:
+    """Build features for the selected shards, then concatenate and validate.
+
+    Safe to re-run: a shard whose ``done_<id>.json`` marker and parquet both check out is
+    skipped, so a failure at shard 4 does not throw away shards 0-3.
+    """
+    global _WORKER_LOG
+    work = Path(work)
+    if n_shards is None:
+        n_shards = len(sorted(int(p.stem.split("_")[1]) for p in work.glob("cand_*.parquet")))
+    if wanted is None:
+        wanted = list(range(n_shards))
+
+    pending: List[int] = []
+    results: Dict[int, dict] = {}
+    for sid in wanted:
+        done = shard_is_complete(sid, work)
+        if done is not None:
+            log(f"shard {sid} already complete ({done['rows']:,} rows, "
+                f"{done.get('seconds')}s) - skipping")
+            results[sid] = done
+        else:
+            pending.append(sid)
+
+    max_workers = args.workers if args.workers and args.workers > 0 else max(1, len(pending))
+    log(f"{len(pending)} shard(s) to build, {len(results)} already done, "
+        f"concurrency={min(max_workers, max(1, len(pending)))}")
+
+    t0 = time.time()
+    running: Dict[int, Any] = {}
+    queue = list(pending)
+    min_available_mb = mem_available_mb()
+    start_available_mb = min_available_mb
+    while queue or running:
+        while queue and len(running) < max_workers:
+            sid = queue.pop(0)
+            proc, logf = launch_worker_subprocess(sid, work, args.chunk_size, records_file)
+            running[sid] = (proc, logf)
+            log(f"  launched shard {sid} (pid {proc.pid}) -> {logf}")
+        time.sleep(POLL_SECONDS)
+        # The question is whether N concurrent workers fit in RAM, so track the low-water
+        # mark of MemAvailable: that is the headroom we actually had to give away.
+        avail = mem_available_mb()
+        if avail == avail:  # not NaN
+            min_available_mb = min(min_available_mb, avail)
+        for sid in list(running):
+            proc, logf = running[sid]
+            rc = proc.poll()
+            if rc is None:
+                continue
+            del running[sid]
+            info = shard_is_complete(sid, work)
+            if rc == 0 and info is not None:
+                log(f"  shard {sid} OK rows={info['rows']:,} {info['seconds']}s "
+                    f"peak_rss={info['peak_rss_mb']}MB "
+                    f"(MemAvailable now {mem_available_mb():.0f}MB, low {min_available_mb:.0f}MB)")
+                results[sid] = info
+            else:
+                tail = ""
+                try:
+                    tail = logf.read_text(encoding="utf-8")[-2000:]
+                except Exception:
+                    pass
+                verdict = ("killed by signal %d" % -rc) if rc < 0 else f"exit {rc}"
+                log(f"  shard {sid} FAILED ({verdict}); marker says "
+                    f"{(info or {}).get('error', 'no marker')}")
+                log(f"  ---- tail of {logf} ----\n{tail}\n  ---- end ----")
+                results[sid] = {"shard": sid, "ok": False, "rows": 0,
+                                "error": f"worker {verdict}"}
+    log(f"feature workers finished in {time.time()-t0:.1f}s; "
+        f"MemAvailable low-water {min_available_mb:.0f}MB (was {start_available_mb:.0f}MB "
+        f"at start, {start_available_mb - min_available_mb:.0f}MB consumed)")
+
+    failed = [sid for sid in results if not results[sid].get("ok")]
+    if failed:
+        log(f"INCOMPLETE shards: {sorted(failed)} - features.parquet NOT written")
+        return 1
+    if not concat:
+        return 0
+
+    ordered = [results[sid] for sid in sorted(results)]
+    total_rows = sum(r["rows"] for r in ordered)
+    log(f"all {len(ordered)} shard(s) complete, {total_rows:,} rows total")
+    t1 = time.time()
+    shard_paths = [work / f"feat_{r['shard']}.parquet" for r in ordered]
+    rows, _cols = concat_shards(shard_paths, out_path)
+    log(f"concatenated {rows:,} feature rows -> {out_path} in {time.time()-t1:.1f}s")
+    if rows != total_rows:
+        log(f"FATAL: concatenated {rows:,} != sum of shards {total_rows:,}")
+        return 1
+
+    # Derive the S1 allow-list from the records file when we have one. Reading the real
+    # slice TSV instead would be wrong for any other input and needlessly slow: the
+    # records frame is the authority on which entity ids exist in this run.
+    known = None
+    if Path(records_file).exists():
+        known = set(
+            pq.read_table(records_file, columns=["entity_id"])
+            .to_pandas()["entity_id"].astype(str)
+        )
+    selected_cand_rows = sum(
+        parquet_rows(work / f"cand_{r['shard']}.parquet") for r in ordered)
+    all_shards = len(ordered) == n_shards
+    n_cand_total = pq.ParquetFile(cand_path).metadata.num_rows
+    checks = validate(
+        out_path,
+        cand_path,
+        Path(SLICE_DIR[0] or "artifacts/slice/data") / "slice_source1.tsv",
+        known_entity_ids=known,
+        expected_rows=selected_cand_rows,
+    )
+    checks["all_shards_covered"] = all_shards
+    checks["covers_full_candidate_set"] = (rows == n_cand_total) if all_shards else None
+    log(f"P2 validation: {json.dumps(checks, indent=2)}")
+    # Coverage is informational for a deliberately partial run: a one-shard diagnostic is
+    # supposed to fail "covers_full_candidate_set", and treating that as a defect buries the
+    # real signal. Only an explicit False is a failure; None means "not applicable".
+    informational = {"all_shards_covered", "covers_full_candidate_set"}
+    bad = [
+        k for k, v in checks.items()
+        if v is False and not (not all_shards and k in informational)
+    ]
+    # Keep the established metrics keys (rows_per_shard / events_per_shard / *_seconds)
+    # so anything reading this file downstream keeps working; the new fields are additive.
+    metrics = {
+        "candidates_in": pq.ParquetFile(cand_path).metadata.num_rows,
+        "events_in": sum(parquet_rows(work / f"events_{i}.parquet") for i in range(n_shards)),
+        "feature_rows": rows,
+        "shards": len(ordered),
+        "concurrency": max_workers,
+        "rows_per_shard": [parquet_rows(work / f"cand_{i}.parquet") for i in range(n_shards)],
+        "events_per_shard": [parquet_rows(work / f"events_{i}.parquet") for i in range(n_shards)],
+        "workers": ordered,
+        "feature_seconds": round(time.time() - t0, 2),
+        "parent_peak_rss_mb": round(peak_rss_mb(), 1),
+        "min_mem_available_mb": round(min_available_mb, 1),
+        "mem_available_at_start_mb": round(start_available_mb, 1),
+        "features_path": str(out_path),
+        "validation": checks,
+    }
+    try:
+        Path(args.metrics).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    except Exception as exc:
+        log(f"could not write metrics: {exc}")
+    if bad:
+        log(f"P2 FAILED checks: {bad}")
+        return 1
+    log(f"P2 COMPLETE: {rows:,} feature rows, 39 cols, validation green")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--candidates", default="artifacts/slice/out/candidates.parquet")
@@ -329,17 +664,72 @@ def main() -> int:
     ap.add_argument("--rows-per-shard", type=int, default=2_200_000)
     ap.add_argument("--chunk-size", type=int, default=50_000)
     ap.add_argument("--reuse", action="store_true", help="keep existing work-dir shard files")
+    ap.add_argument(
+        "--stage", choices=["all", "prepare", "features"], default="all",
+        help="prepare: only write cand_*/events_* shards. features: only build features "
+             "from existing shards (never touches them). all: both, as before.",
+    )
+    ap.add_argument(
+        "--workers", type=int, default=0,
+        help="max concurrent feature workers; 0 = one per shard. Separate from --shards "
+             "on purpose, so concurrency can be tuned from measured memory.",
+    )
+    ap.add_argument(
+        "--run-worker", type=int, default=None,
+        help="internal: build exactly this one shard in this process, then exit. Must be "
+             "checked before any orchestration, otherwise the child re-enters the stage "
+             "and spawns children of its own (fork bomb).",
+    )
+    ap.add_argument(
+        "--only-shards", default="",
+        help="comma-separated shard ids to process, e.g. '0' for a single-shard diagnostic",
+    )
+    ap.add_argument(
+        "--candidate-batch-rows", type=int, default=200_000,
+        help="rows per candidate read batch (tests lower this to force several flushes)",
+    )
+    ap.add_argument(
+        "--candidate-flush-rows", type=int, default=400_000,
+        help="rows buffered before writing candidate shards (tests lower this to force "
+             "multiple flushes, which is where shard routing was previously wrong)",
+    )
     args = ap.parse_args()
 
     global _RECORDS
     t_start = time.time()
+    global SLICE_DIR
+    SLICE_DIR = [args.slice_dir]
     work = Path(args.work_dir)
-    if work.exists() and not args.reuse:
+    if work.exists() and not args.reuse and args.stage != "features" and args.run_worker is None:
+        # Never rmtree when we are only consuming shards: that would destroy the very
+        # inputs the run exists to use, and they are expensive to rebuild. A worker
+        # process must never delete the directory it was launched into.
         shutil.rmtree(work)
     work.mkdir(parents=True, exist_ok=True)
 
     cand_path, ev_path = Path(args.candidates), Path(args.events)
     out_path = Path(args.out)
+    records_file = work / "records.parquet"
+
+    if args.run_worker is not None:
+        # A worker must never orchestrate. Everything above is bookkeeping only; the first
+        # real work is this branch, so a child cannot recurse into a second generation.
+        sid = args.run_worker
+        rec = records_file if Path(records_file).exists() else (
+            Path(args.records) if args.records and Path(args.records).exists() else None)
+        task = (sid,
+                work / f"cand_{sid}.parquet",
+                work / f"events_{sid}.parquet",
+                work / f"feat_{sid}.parquet",
+                args.chunk_size, "", rec, work)
+        try:
+            info = _worker(task)
+        except BaseException as exc:  # already logged with traceback by _worker
+            log(f"[worker {sid}] aborting: {type(exc).__name__}: {exc}")
+            return 1
+        log(f"[worker {sid}] marker written ok={info['ok']}")
+        return 0
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     for p in (cand_path, ev_path):
         if not p.exists():
@@ -347,6 +737,12 @@ def main() -> int:
             return 1
 
     n_cand_total = pq.ParquetFile(cand_path).metadata.num_rows
+
+    if args.stage == "features":
+        wanted = [int(x) for x in args.only_shards.split(",") if x.strip() != ""] or None
+        return run_features_stage(args, work, cand_path, out_path, records_file,
+                                  wanted=wanted)
+
     n_shards = max(1, min(args.shards, -(-n_cand_total // args.rows_per_shard)))
     log(f"P2 start: {n_cand_total:,} candidates, {n_shards} shards, "
         f"events={pq.ParquetFile(ev_path).metadata.num_rows:,}")
@@ -356,6 +752,11 @@ def main() -> int:
         log(f"records loaded from {args.records}: {len(_RECORDS):,} rows")
     else:
         _RECORDS = build_records(Path(args.slice_dir))
+    if not records_file.exists():
+        # Children read this instead of each re-normalising 1.7M text records.
+        pq.write_table(pa.Table.from_pandas(_RECORDS, preserve_index=False),
+                       records_file, compression="zstd")
+        log(f"records cached for workers -> {records_file}")
 
     nominal = shard_bounds(n_cand_total, n_shards)
     # Event routing below uses searchsorted over shard-boundary s1_ids, which is only
@@ -379,8 +780,17 @@ def main() -> int:
     def flush() -> None:
         if not buf:
             return
-        frame = pd.concat(buf, ignore_index=True)
+        # Must NOT pass ignore_index=True: each frame's index was deliberately set to its
+        # absolute row position above, and that index is what routes rows to shards via
+        # searchsorted. Resetting it would re-map every flush to shard 0, which is
+        # invisible whenever the whole input fits in one flush and silently puts the
+        # entire candidate set in shard 0 as soon as it does not.
+        frame = pd.concat(buf)
         buf.clear()
+        if not np.array_equal(frame.index.to_numpy(), np.arange(pos - len(frame), pos)):
+            raise RuntimeError(
+                "candidate buffer lost its absolute row index; shard routing would be wrong"
+            )
         ends = np.searchsorted(np.asarray(offsets, dtype=np.int64),
                                frame.index.to_numpy(), side="right") - 1
         ends = np.clip(ends, 0, len(bounds) - 1)
@@ -394,14 +804,14 @@ def main() -> int:
             writers[sid].write_table(table)
 
     for batch in pq.ParquetFile(cand_path).iter_batches(
-        batch_size=200_000, columns=CANDIDATE_KEY_COLUMNS
+        batch_size=args.candidate_batch_rows, columns=CANDIDATE_KEY_COLUMNS
     ):
         frame = batch.to_pandas()
         if len(frame):
             frame.index = np.arange(pos, pos + len(frame))
             pos += len(frame)
             buf.append(frame)
-        if sum(len(f) for f in buf) >= 400_000:
+        if sum(len(f) for f in buf) >= args.candidate_flush_rows:
             flush()
     flush()
     for w in writers:
@@ -417,69 +827,30 @@ def main() -> int:
     ev_counts = partition_events(ev_path, work, s1_boundaries, len(bounds))
     log(f"events partitioned in {time.time()-t0:.1f}s: {ev_counts}")
 
-    tasks = [
-        (
-            i,
-            work / f"cand_{i}.parquet",
-            work / f"events_{i}.parquet" if ev_counts[i] else Path("/nonexistent"),
-            work / f"feat_{i}.parquet",
-            args.chunk_size,
-            f"shard{i}",
-        )
-        for i in range(len(bounds))
-        if cand_shard_rows[i] > 0
-    ]
+    cand_shard_rows_all = cand_shard_rows
+    ev_counts_all = ev_counts
+    bounds_n = len(bounds)
+    if args.stage == "prepare":
+        log("P2 PREPARE COMPLETE (candidate + event shards written; no features built)")
+        return 0
 
-    ctx = mp.get_context("fork")
-    log(f"launching {len(tasks)} feature workers (parent RSS {rss_mb():.0f} MB)")
-    t0 = time.time()
-    if len(tasks) == 1:
-        results = [_worker(tasks[0])]
+    if args.only_shards:
+        wanted = [int(x) for x in args.only_shards.split(",") if x.strip() != ""]
     else:
-        with ctx.Pool(processes=len(tasks)) as pool:
-            results = []
-            for r in pool.imap_unordered(_worker, tasks):
-                results.append(r)
-                done = sum(x["rows"] for x in results)
-                log(f"  worker {r['shard']} done rows={r['rows']:,} events={r['events']:,} "
-                    f"{r['seconds']}s  ({done:,}/{n_cand_total:,})")
-    feature_seconds = time.time() - t0
-    log(f"feature workers done in {feature_seconds:.1f}s")
+        wanted = list(range(bounds_n))
+    log(f"feature stage: shards {wanted} of {bounds_n}")
 
+    # run_features_stage owns the whole feature phase: it builds the selected shards,
+    # concatenates them in order, validates the result, writes metrics, and returns a
+    # process exit code. Nothing concatenates or validates a second time.
     t0 = time.time()
-    shard_paths = [work / f"feat_{r['shard']}.parquet" for r in sorted(results, key=lambda x: x["shard"])]
-    rows, cols = concat_shards(shard_paths, out_path)
-    log(f"concatenated {rows:,} feature rows -> {out_path} in {time.time()-t0:.1f}s")
-
-    checks = validate(
-        out_path,
-        cand_path,
-        Path(args.slice_dir) / "slice_source1.tsv",
-        known_entity_ids=set(_RECORDS["entity_id"].astype(str)) if args.records else None,
+    rc = run_features_stage(
+        args, work, cand_path, out_path, records_file,
+        wanted=wanted, n_shards=bounds_n, concat=True,
     )
-    total_seconds = time.time() - t_start
-    metrics = {
-        "candidates_in": n_cand_total,
-        "events_in": pq.ParquetFile(ev_path).metadata.num_rows,
-        "feature_rows": rows,
-        "shards": len(tasks),
-        "rows_per_shard": cand_shard_rows,
-        "events_per_shard": ev_counts,
-        "workers": sorted(results, key=lambda x: x["shard"]),
-        "feature_seconds": round(feature_seconds, 2),
-        "total_seconds": round(total_seconds, 2),
-        "parent_peak_rss_mb": round(rss_mb(), 1),
-        "features_path": str(out_path),
-        "validation": checks,
-    }
-    Path(args.metrics).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    log(f"P2 validation: {checks}")
-    failed = [k for k, v in checks.items() if not v]
-    if failed:
-        log(f"P2 FAILED checks: {failed}")
-        return 1
-    log(f"P2 COMPLETE in {total_seconds/60:.1f} min")
-    return 0
+    log(f"feature stage finished rc={rc} in {time.time()-t0:.1f}s "
+        f"(total {time.time()-t_start:.1f}s)")
+    return rc
 
 
 if __name__ == "__main__":

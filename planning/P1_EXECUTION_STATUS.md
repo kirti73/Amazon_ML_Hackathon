@@ -1121,3 +1121,95 @@ declared or packaged already:
 
 Baseline was 106 collectable tests; the suite is now **187 passed, 0 failed, 0 errors**
 with no ignores.
+
+## P1 COMPLETE — all 8 routes finalized and validated (2026-09-27 ~11:05)
+
+### P.1 Worker completion
+All eight workers finished. Union of the original spill plus nine worker spills:
+
+| worker | events | peak RSS | spill |
+|---|---:|---:|---|
+| `exact_name` (original) | 400,587 | - | `/var/tmp/p1_spill_slice` |
+| `tfidf_name` (original) | 6,000,000 | - | `/var/tmp/p1_spill_slice` |
+| `rare_token_name` (original) | 5,966,750 | - | `/var/tmp/p1_spill_slice` |
+| `tfidf_address` (original prefix) | 2,850,000 | - | `/var/tmp/p1_spill_slice` |
+| `tfidf_address` 0-5 (new) | 3,150,000 (525,000 x 6) | ~978 MB ea | `/var/tmp/p1_w_tfidfaddr_{0..5}` |
+| `numeric_address` | 5,177,836 | 741 MB | `/var/tmp/p1_w_numeric_address` |
+| `rare_token_address` | 5,999,903 | 1,227 MB | `/var/tmp/p1_w_rare_token_address` |
+| `reverse_retrieval` | 6,527,271 | 927 MB | `/var/tmp/p1_w_reverse_retrieval` |
+| **total** | **36,072,347** | | |
+
+`tfidf_address` is the only route whose total is split: 2,850,000 (original) + 3,150,000
+(new) = **6,000,000**, matching the other two full-pool routes. The sharded resume was exact.
+
+Mean events per S1: exact_name 1.34, rare_token_name 19.89, rare_token_address 20.00,
+tfidf_name 20.00, tfidf_address 20.00, numeric_address 17.26, reverse_retrieval 21.76.
+Five of seven routes sit at their `top_k=20` cap, so per-route recall, not the cap, is the
+binding constraint on those.
+
+### P.2 Finalize (bounded, 3-pass, 10 spill dirs)
+`scripts/run_p1_parallel.py --mode finalize` over the union of all 10 spill directories:
+
+- **pass 1** (union events per bucket, write once): 36,072,347 rows in **31.1 s**, RSS 476 MB
+- **pass 2** (canonicalize one bucket at a time): 30,883,710 candidate rows in **84.3 s**, RSS 474-617 MB
+- **pass 3** (lazy `heapq.merge` of 64 sorted bucket files): 30,883,710 candidates in **93.6 s**
+- **total 207.05 s, peak RSS 2,395.8 MB**
+
+Artifacts: `artifacts/slice/out/candidates.parquet` (622 MB),
+`artifacts/slice/out/retrieval_events.parquet` (591 MB).
+
+36,072,347 events collapse to 30,883,710 candidates (1.17 events per candidate), so
+routes overlap heavily, as expected from a union of seven independent retrievals.
+
+### P.3 `scripts/validate_p1_slice.py` — new independent gate
+No P1 validation program existed, so one was written as a *separate* program: a producer
+that also marks its own homework tends to define "correct" as whatever it emitted. It
+re-derives every expectation from the raw slice inputs. **15/15 checks PASS:**
+
+schema (candidates = `docs/schemas.md` s6, events), non-empty, `pair_key` unique,
+candidates globally `s1_id`-sorted, `pair_key == s1_id + "::" + candidate_id`, no null ids,
+`candidate_source in {S2,S3}`, `1 <= n_routes <= 7`, pool-file readability,
+**every `s1_id` in the slice S1 set** (0 unknown), **every `candidate_id` in the slice
+pool** (0 unknown), all 7 routes present, `rank >= 1`, every event pair in candidates
+(0 orphans), every candidate has >= 1 event (0 without), events bucket-partitioned with
+non-decreasing bucket id, and `rank` a dense `1..k` per `(s1_id, route)`.
+
+Two of my initial checks were wrong and were corrected rather than the data:
+- I asserted `retrieval_events.parquet` was `s1_id`-sorted. It is not, and is **not
+  supposed to be** -- the writer emits bucket by bucket, so the file is
+  `crc32(s1_id) % 64` partitioned. The replaced check is the one that actually protects
+  the merge: bucket ids never decrease, so no `(s1_id, route)` can be split across files.
+- Recall was first measured against *all* ground-truth pairs and read **0.1341**, which
+  looked like a blocking failure. It is not one; see below.
+
+### P.4 The recall number: 0.1341 was a bad denominator
+**This slice's ground truth is inherited verbatim from the full dataset**, so each S1's
+`matched_entity_ids` still point at the *full* S2/S3 pool. Measured on this slice:
+
+- ground-truth pairs: **1,037,782**
+- of those, pairs whose candidate exists in the sampled 1,402,952-id pool: **141,095 (13.60%)**
+- pairs referencing entities **outside** the pool: **896,687 (86.40%)**
+
+No blocking scheme over a 1.4M pool can return an entity that is not in it, so 86.4% of
+the ground truth is unreachable **by construction**. Gating on that denominator reports
+~0.13 no matter how good the retrieval is, and says nothing about P1.
+
+Measured on the pairs that *are* reachable:
+
+| metric | value |
+|---|---|
+| **pair recall (pool-resident)** | **0.9867** (139,212 / 141,095) |
+| **entity recall (pool-resident)** | **0.9892** (112,008 / 113,231) |
+| pool coverage of the ground truth | 0.1360 |
+
+Cross-check: on a random sample of GT pairs where both endpoints resolve inside the slice,
+recall is **0.9845**, and it is 0.98-1.00 in every stratum -- name exactly equal, address
+exactly equal, name exact only, and *neither* field equal (0.9773). So the misses are not
+concentrated in any particular name/address relationship; they are the pool-absent pairs.
+
+The gate now requires `pair_recall_pool_resident >= 0.90` and reports `pair_recall_all`
+alongside it **with a note explaining why it is not the gate**, so the gap stays visible
+rather than being quietly dropped.
+
+**P1 verdict: PASS. 30,883,710 candidates at 98.67% recall on everything reachable, all
+seven routes contributing, peak RSS 2.4 GB end to end.**

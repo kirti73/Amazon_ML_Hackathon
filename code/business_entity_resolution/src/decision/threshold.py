@@ -342,6 +342,184 @@ def tune_two_thresholds(
     return round(best_t1, 6), round(best_t2, 6)
 
 
+class _EntityTally:
+    """Per-entity arrays that turn threshold search into array arithmetic.
+
+    The reference path materialises a ``dict`` of ``set``s at every one of the
+    ``n_grid ** 2`` grid points, so it pays a full Python pass over the candidates per
+    grid point. On a real candidate set that is hours rather than minutes, and it is the
+    same shape of problem as the retrieval pivot in ``src.features.retrieval_features``.
+
+    Candidates are pre-sorted by descending score, so the ones clearing a threshold form
+    a *prefix* of each entity's block. That means two prefix sums are all a ``t2`` needs:
+
+    * ``keep`` -- rows with ``score >= t2``, so ``keep_i`` is a prefix length;
+    * ``tp`` -- rows that are true matches, so the true positives inside that prefix are a
+      prefix sum too.
+
+    ``t1`` never changes *which* candidates are emitted, only whether the entity abstains
+    at all: it contributes nothing when ``best_score < max(t1, t2)``. So one vectorised
+    pass per ``t2`` serves every ``t1`` on that row of the grid.
+    """
+
+    __slots__ = (
+        "_score", "_starts", "_ends", "_best", "_first", "_in_truth",
+        "_k_true", "_n_truth", "_n_singletons", "_n_scored_singletons",
+    )
+
+    def __init__(self, scores_df: pd.DataFrame, ground_truth_by_s1, score_column: str) -> None:
+        truth = _normalize_ground_truth(ground_truth_by_s1)
+        self._n_truth = len(truth)
+        self._n_singletons = sum(1 for m in truth.values() if not m)
+
+        ordered = scores_df.sort_values(
+            by=["s1_id", score_column, "candidate_id"],
+            ascending=[True, False, True],
+            kind="mergesort",
+        )
+        s1 = ordered["s1_id"].to_numpy()
+        candidate = ordered["candidate_id"].to_numpy()
+        self._score = ordered[score_column].to_numpy(dtype=float)
+
+        if s1.size:
+            change = np.empty(s1.shape[0], dtype=bool)
+            change[0] = True
+            change[1:] = s1[1:] != s1[:-1]
+            self._starts = np.flatnonzero(change).astype(np.int64)
+        else:
+            self._starts = np.zeros(0, dtype=np.int64)
+        self._ends = np.empty_like(self._starts)
+        if self._starts.size:
+            self._ends[:-1] = self._starts[1:]
+            self._ends[-1] = self._score.size
+
+        # A candidate counts once, no matter how many rows it occupies. Rows are sorted by
+        # descending score, so a candidate's *first* row carries its maximum score and a
+        # candidate is in the selected set exactly when that first row clears the
+        # threshold. Counting only first occurrences therefore reproduces the reference's
+        # set semantics; counting rows would let a duplicate inflate n_pred and push
+        # F0.5 above 1.0.
+        #
+        # ``duplicated`` rather than an adjacency test: two rows for the same candidate can
+        # carry different scores, so after sorting by score they are *not* necessarily
+        # adjacent (``A(0.9), B(0.8), A(0.7)``). ``duplicated`` keys on the group identity
+        # and keeps whichever row it saw first, which is the highest-scoring one.
+        if s1.size:
+            keys = pd.DataFrame({"_s1": s1, "_cand": candidate})
+            first = ~keys.duplicated(subset=["_s1", "_cand"]).to_numpy()
+        else:
+            first = np.zeros(0, dtype=bool)
+        self._first = first
+
+        # Per-row truth flag via a hash join rather than a Python loop over candidates.
+        in_truth = np.zeros(s1.shape[0], dtype=bool)
+        if s1.size and truth:
+            pairs_s1: List[str] = []
+            pairs_c: List[str] = []
+            for s1_id, matches in truth.items():
+                if matches:
+                    pairs_s1.extend([s1_id] * len(matches))
+                    pairs_c.extend(matches)
+            if pairs_s1:
+                joined = pd.DataFrame({"s1_id": pairs_s1, "candidate_id": pairs_c})
+                joined["_tp"] = 1
+                marked = pd.DataFrame({"s1_id": s1, "candidate_id": candidate})
+                marked = marked.merge(joined, on=["s1_id", "candidate_id"], how="left")
+                in_truth = marked["_tp"].fillna(0).to_numpy().astype(bool)
+        self._in_truth = in_truth
+        self._best = self._score[self._starts] if self._starts.size else np.zeros(0, float)
+        # ``get`` with an empty default: a truth entity with no candidate rows is not in
+        # ``_starts`` and is accounted for by the unscored-entity tally below, so it must
+        # not be indexed here.
+        self._k_true = np.array(
+            [len(truth.get(str(s1[s]), ())) for s in self._starts], dtype=np.float64
+        ) if self._starts.size else np.zeros(0, dtype=np.float64)
+        self._n_scored_singletons = int((self._k_true == 0).sum())
+
+    @property
+    def best_scores(self) -> np.ndarray:
+        return self._best
+
+    def keep_and_tp(self, t2: float) -> Tuple[np.ndarray, np.ndarray]:
+        """``(keep, tp)`` per scored entity for one ``t2`` value."""
+        if self._starts.size == 0:
+            empty = np.zeros(0, dtype=np.float64)
+            return empty, empty
+        # Both tallies must be prefix sums of the *same* masked array: the true positives
+        # that survive are the ones inside the kept prefix, not every truth row in the
+        # entity block. A block-wide truth count would credit matches the threshold
+        # excluded, and can drive F0.5 above 1.0.
+        mask = (self._score >= float(t2)) & self._first
+        zero = np.zeros(1, dtype=np.int64)
+        keep_cum = np.concatenate((zero, np.cumsum(mask)))
+        keep = keep_cum[self._ends] - keep_cum[self._starts]
+        tp_cum = np.concatenate((zero, np.cumsum(mask & self._in_truth)))
+        tp = tp_cum[self._ends] - tp_cum[self._starts]
+        return keep.astype(np.float64), tp.astype(np.float64)
+
+    def macro_f05_for(self, t1: float, t2: float, keep: np.ndarray, tp: np.ndarray) -> float:
+        """Macro-F0.5 for one ``(T1, T2)`` pair, from the precomputed ``t2`` tallies."""
+        if self._n_truth == 0:
+            return 0.0
+        if self._starts.size == 0:
+            return float(self._n_singletons) / self._n_truth
+
+        active = self._best >= max(float(t1), float(t2))
+        n_pred = np.where(active, keep, 0.0)
+        tp = np.where(active, tp, 0.0)
+        k_true = self._k_true
+
+        # F0.5 written in counts: 1.25 * tp / (0.25 * n_true + n_pred). This is the
+        # precision/recall form with n_pred and n_true divided through, and it is exact.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            f = np.where(n_pred > 0, 1.25 * tp / (0.25 * k_true + n_pred), 0.0)
+        # A singleton that emitted nothing is correct; one that emitted anything is not.
+        f = np.where(k_true == 0, np.where(n_pred == 0, 1.0, 0.0), f)
+
+        total = float(f.sum())
+        # Truth entities with no candidate rows at all are n_pred=0, so singletons score
+        # 1.0 and everything else 0.0 -- they still count in the mean.
+        total += self._n_singletons - self._n_scored_singletons
+        return total / self._n_truth
+
+
+def tune_two_thresholds_fast(
+    oof_scores_df: pd.DataFrame,
+    ground_truth_by_s1: Mapping[str, Iterable[str]],
+    n_grid: int = DEFAULT_THRESHOLD_GRID_SIZE,
+    score_column: str = "p_cal",
+    require_t2_ge_t1: bool = True,
+) -> Tuple[float, float]:
+    """Vectorised equivalent of :func:`tune_two_thresholds`.
+
+    Identical grid, identical tie-breaking (lowest ``T1`` then lowest ``T2`` wins) and
+    identical ``macro_f05`` values; only the per-grid-point cost changes, from a Python
+    pass over every candidate to array arithmetic over the score column. The reference
+    implementation is retained and ``tests/test_threshold_fast.py`` asserts the two agree
+    exactly on randomised inputs, including degenerate ones.
+    """
+    scores_df = _validate_oof(oof_scores_df)
+    grid = build_threshold_grid(scores_df[score_column].to_numpy(dtype=float), n_grid=n_grid)
+    tally = _EntityTally(scores_df, ground_truth_by_s1, score_column)
+
+    best_t1 = float(grid[0])
+    best_t2 = float(grid[0])
+    best_score = -np.inf
+
+    for t2 in grid:
+        keep, tp = tally.keep_and_tp(float(t2))
+        for t1 in grid:
+            if require_t2_ge_t1 and t2 < t1:
+                continue
+            score = tally.macro_f05_for(float(t1), float(t2), keep, tp)
+            if score > best_score:
+                best_score = score
+                best_t1 = float(t1)
+                best_t2 = float(t2)
+
+    return round(best_t1, 6), round(best_t2, 6)
+
+
 def save_decision_config(
     config: Dict[str, Any],
     output_path: Optional[str] = None,
