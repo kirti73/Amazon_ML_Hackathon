@@ -27,9 +27,11 @@ NFKC -> casefold -> punctuation->space -> whitespace collapse
 import re
 import unicodedata
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+
+from .spill import RecordBuffer
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -77,11 +79,12 @@ def _build_name_index(
 ) -> Dict[str, List[Tuple[str, str]]]:
     """Build a dict: normalized_name -> [(entity_id, source_label), ...]."""
     index: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-    for _, row in df.iterrows():
-        key = normalize_name(str(row.get(name_col, "") or ""))
+    eids = df[id_col].astype(str).tolist()
+    names = df[name_col].fillna("").astype(str).tolist() if name_col in df.columns else [""] * len(df)
+    for eid, raw_name in zip(eids, names):
+        key = normalize_name(raw_name)
         if not key:
             continue
-        eid = str(row[id_col])
         index[key].append((eid, source_label))
     return index
 
@@ -118,6 +121,7 @@ def retrieve_exact_name(
     id_col: str = "entity_id",
     name_col: str = "business_name",
     max_block_size: int = MAX_BLOCK_SIZE,
+    sink: Optional["RecordBuffer"] = None,
 ) -> pd.DataFrame:
     """Exact normalized-name blocking: Route 1.
 
@@ -127,19 +131,30 @@ def retrieve_exact_name(
     id_col              : Column name for entity ID.
     name_col            : Column name for business name.
     max_block_size      : Maximum candidates per normalized-name bucket.
+    sink                : Optional :class:`~src.blocking.spill.RecordBuffer`. When supplied,
+                          records are streamed out in bounded batches instead of being
+                          accumulated in a Python list. Required for full-scale runs: this
+                          route emits ~21.8M records at full scale (~11.9 GB as dicts).
 
     Returns
     -------
     DataFrame with columns:
         pair_key, s1_id, candidate_id, candidate_source,
         route, rank, score
+
+    When ``sink`` is supplied the return value is the empty candidate frame: the records
+    have already been handed to the sink. Record contents, order, and values are identical
+    either way.
     """
     pool_index = build_combined_index(s2_df, s3_df, id_col=id_col, name_col=name_col)
 
-    records = []
-    for _, row in s1_df.iterrows():
-        s1_id = str(row[id_col])
-        key = normalize_name(str(row.get(name_col, "") or ""))
+    # Bounded accumulator. With no sink this degrades to the historical unbounded list, which
+    # is retained deliberately as the in-memory equivalence reference.
+    buf = sink if sink is not None else RecordBuffer(None)
+    s1_ids = s1_df[id_col].astype(str).tolist()
+    s1_names = s1_df[name_col].fillna("").astype(str).tolist() if name_col in s1_df.columns else [""] * len(s1_df)
+    for s1_id, raw_name in zip(s1_ids, s1_names):
+        key = normalize_name(raw_name)
         if not key:
             continue
 
@@ -152,7 +167,7 @@ def retrieve_exact_name(
             candidates = candidates[:max_block_size]
 
         for rank, (cand_id, cand_src) in enumerate(candidates, start=1):
-            records.append(
+            buf.append(
                 {
                     "pair_key": f"{s1_id}::{cand_id}",
                     "s1_id": s1_id,
@@ -164,10 +179,15 @@ def retrieve_exact_name(
                 }
             )
 
-    if not records:
+    buf.close()
+
+    if sink is not None:
         return _empty_candidate_df()
 
-    return pd.DataFrame(records, columns=_candidate_columns())
+    result = buf.result()
+    if len(result) == 0:
+        return _empty_candidate_df()
+    return result
 
 
 # ---------------------------------------------------------------------------

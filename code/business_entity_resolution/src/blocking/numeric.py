@@ -29,6 +29,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
+from .spill import RecordBuffer
+
 # ---------------------------------------------------------------------------
 # Constants & Defaults
 # ---------------------------------------------------------------------------
@@ -114,9 +116,9 @@ class NumericTokenIndex:
             sources.append((s1_df, "S1"))
 
         for df, _ in sources:
-            for _, row in df.iterrows():
+            raw_addrs = df[addr_col].fillna("").astype(str).tolist() if addr_col in df.columns else [""] * len(df)
+            for raw in raw_addrs:
                 total_docs += 1
-                raw = str(row.get(addr_col, "") or "")
                 tokens = set(extract_numeric_tokens(raw))
                 df_counts.update(tokens)
 
@@ -131,9 +133,9 @@ class NumericTokenIndex:
 
         # Index S2 and S3 candidates
         for df, src_label in [(s2_df, "S2"), (s3_df, "S3")]:
-            for _, row in df.iterrows():
-                eid = str(row[id_col])
-                raw = str(row.get(addr_col, "") or "")
+            eids = df[id_col].astype(str).tolist()
+            raw_addrs = df[addr_col].fillna("").astype(str).tolist() if addr_col in df.columns else [""] * len(df)
+            for eid, raw in zip(eids, raw_addrs):
                 tokens = set(extract_numeric_tokens(raw))
 
                 for token in tokens:
@@ -154,13 +156,18 @@ class NumericTokenIndex:
         id_col: str = "entity_id",
         addr_col: str = "business_address",
         top_k: int = DEFAULT_TOP_K,
+        sink: Optional[RecordBuffer] = None,
     ) -> pd.DataFrame:
-        """Query S1 records against the numeric inverted index."""
-        records = []
+        """Query S1 records against the numeric inverted index.
 
-        for _, row in s1_df.iterrows():
-            s1_id = str(row[id_col])
-            raw = str(row.get(addr_col, "") or "")
+        When ``sink`` is supplied records stream out in bounded batches and the empty
+        candidate frame is returned; record values and order are unchanged either way.
+        """
+        buf = sink if sink is not None else RecordBuffer(None)
+        s1_ids = s1_df[id_col].astype(str).tolist()
+        s1_raw_addrs = s1_df[addr_col].fillna("").astype(str).tolist() if addr_col in s1_df.columns else [""] * len(s1_df)
+
+        for s1_id, raw in zip(s1_ids, s1_raw_addrs):
             tokens = set(extract_numeric_tokens(raw))
 
             if not tokens:
@@ -190,7 +197,7 @@ class NumericTokenIndex:
 
             for rank, ((cand_id, cand_src), raw_score) in enumerate(top_cands, start=1):
                 norm_score = min(raw_score / s1_idf_sum, 1.0)
-                records.append(
+                buf.append(
                     {
                         "pair_key": f"{s1_id}::{cand_id}",
                         "s1_id": s1_id,
@@ -202,10 +209,15 @@ class NumericTokenIndex:
                     }
                 )
 
-        if not records:
+        buf.close()
+
+        if sink is not None:
             return _empty_candidate_df()
 
-        return pd.DataFrame(records, columns=_candidate_columns())
+        result = buf.result()
+        if len(result) == 0:
+            return _empty_candidate_df()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +232,7 @@ def retrieve_numeric(
     top_k: int = DEFAULT_TOP_K,
     max_block_size: int = DEFAULT_MAX_BLOCK_SIZE,
     max_df_ratio: float = DEFAULT_MAX_DF_RATIO,
+    sink: Optional[RecordBuffer] = None,
 ) -> pd.DataFrame:
     """Route 5: Retrieve candidates using numeric/address tokens.
 
@@ -231,6 +244,8 @@ def retrieve_numeric(
     top_k               : Max candidates to retrieve per S1.
     max_block_size      : Max postings per token bucket (default 500).
     max_df_ratio        : Document frequency ratio filter for common numbers.
+    sink                : Optional RecordBuffer for bounded-memory streaming. Required at
+                          full scale (this route emits up to ~33.4M records).
 
     Returns
     -------
@@ -254,6 +269,7 @@ def retrieve_numeric(
         id_col=id_col,
         addr_col=addr_col,
         top_k=top_k,
+        sink=sink,
     )
 
 

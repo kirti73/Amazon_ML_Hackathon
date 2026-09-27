@@ -27,6 +27,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
+from .spill import RecordBuffer
+
 # ---------------------------------------------------------------------------
 # Constants & Defaults
 # ---------------------------------------------------------------------------
@@ -103,9 +105,9 @@ class RareTokenIndex:
             sources_to_count.append((s1_df, "S1"))
 
         for df, _ in sources_to_count:
-            for _, row in df.iterrows():
+            raw_texts = df[text_col].fillna("").astype(str).tolist() if text_col in df.columns else [""] * len(df)
+            for raw in raw_texts:
                 total_docs += 1
-                raw = str(row.get(text_col, "") or "")
                 tokens = set(tokenize(raw, min_len=self.min_token_len))
                 df_counts.update(tokens)
 
@@ -118,9 +120,9 @@ class RareTokenIndex:
 
         # Build inverted index for S2 and S3 candidates
         for df, src_label in [(s2_df, "S2"), (s3_df, "S3")]:
-            for _, row in df.iterrows():
-                eid = str(row[id_col])
-                raw = str(row.get(text_col, "") or "")
+            eids = df[id_col].astype(str).tolist()
+            raw_texts = df[text_col].fillna("").astype(str).tolist() if text_col in df.columns else [""] * len(df)
+            for eid, raw in zip(eids, raw_texts):
                 tokens = set(tokenize(raw, min_len=self.min_token_len))
 
                 for token in tokens:
@@ -142,13 +144,18 @@ class RareTokenIndex:
         text_col: str = "business_name",
         top_k: int = DEFAULT_TOP_K,
         route_name: str = ROUTE_NAME_TOKEN_NAME,
+        sink: Optional[RecordBuffer] = None,
     ) -> pd.DataFrame:
-        """Query S1 records against the inverted index and return top-k candidates."""
-        records = []
+        """Query S1 records against the inverted index and return top-k candidates.
 
-        for _, row in s1_df.iterrows():
-            s1_id = str(row[id_col])
-            raw = str(row.get(text_col, "") or "")
+        When ``sink`` is supplied records stream out in bounded batches and the empty
+        candidate frame is returned; record values and order are unchanged either way.
+        """
+        buf = sink if sink is not None else RecordBuffer(None)
+        s1_ids = s1_df[id_col].astype(str).tolist()
+        s1_raw_texts = s1_df[text_col].fillna("").astype(str).tolist() if text_col in s1_df.columns else [""] * len(s1_df)
+
+        for s1_id, raw in zip(s1_ids, s1_raw_texts):
             tokens = set(tokenize(raw, min_len=self.min_token_len))
 
             if not tokens:
@@ -179,7 +186,7 @@ class RareTokenIndex:
                 top_candidates, start=1
             ):
                 norm_score = min(raw_score / s1_idf_sum, 1.0)
-                records.append(
+                buf.append(
                     {
                         "pair_key": f"{s1_id}::{cand_id}",
                         "s1_id": s1_id,
@@ -191,10 +198,15 @@ class RareTokenIndex:
                     }
                 )
 
-        if not records:
+        buf.close()
+
+        if sink is not None:
             return _empty_candidate_df()
 
-        return pd.DataFrame(records, columns=_candidate_columns())
+        result = buf.result()
+        if len(result) == 0:
+            return _empty_candidate_df()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +221,7 @@ def retrieve_rare_token_name(
     top_k: int = DEFAULT_TOP_K,
     max_block_size: int = DEFAULT_MAX_BLOCK_SIZE,
     max_df_ratio: float = DEFAULT_MAX_DF_RATIO,
+    sink: Optional[RecordBuffer] = None,
 ) -> pd.DataFrame:
     """Route 3: Retrieve candidates using rare/informative business name tokens."""
     index = RareTokenIndex(
@@ -229,6 +242,7 @@ def retrieve_rare_token_name(
         text_col=name_col,
         top_k=top_k,
         route_name=ROUTE_NAME_TOKEN_NAME,
+        sink=sink,
     )
 
 
@@ -244,6 +258,7 @@ def retrieve_rare_token_address(
     top_k: int = DEFAULT_TOP_K,
     max_block_size: int = DEFAULT_MAX_BLOCK_SIZE,
     max_df_ratio: float = DEFAULT_MAX_DF_RATIO,
+    sink: Optional[RecordBuffer] = None,
 ) -> pd.DataFrame:
     """Route 6: Retrieve candidates using rare/informative address tokens (localities, landmarks)."""
     index = RareTokenIndex(
@@ -264,6 +279,7 @@ def retrieve_rare_token_address(
         text_col=addr_col,
         top_k=top_k,
         route_name=ROUTE_NAME_TOKEN_ADDR,
+        sink=sink,
     )
 
 
